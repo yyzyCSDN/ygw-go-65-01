@@ -27,7 +27,11 @@ func (q *Queue) DequeueBatch(n int) Batch {
 	}
 	batch := make([]*model.Call, 0, end-q.head)
 	batch = append(batch, q.items[q.head:end]...)
-	q.head = q.head + n
+	// Advance head to end, the clamped tail of the slice we actually took.
+	// Advancing by n instead would overshoot len(q.items) whenever the batch
+	// was shorter than n (the queue length is not a multiple of the batch
+	// size), stranding calls after head and flipping More to false early.
+	q.head = end
 	more := q.head < len(q.items)
 	return Batch{Calls: batch, More: more}
 }
