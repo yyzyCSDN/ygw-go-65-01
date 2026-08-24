@@ -47,8 +47,13 @@ func NewManager(registry funcRegistry, booter Booter, liveness InstanceLiveness)
 func (m *Manager) Ensure(ctx context.Context, funcName string) (*model.Instance, error) {
 	m.mu.Lock()
 	if inst, ok := m.cache[funcName]; ok {
-		m.mu.Unlock()
-		return inst, nil
+		if m.liveness == nil || m.liveness.IsLive(inst.ID) {
+			m.mu.Unlock()
+			return inst, nil
+		}
+		// The cached instance has been reclaimed; drop the stale entry so
+		// subsequent calls boot a fresh one instead of routing into a dead instance.
+		delete(m.cache, funcName)
 	}
 	ready, alreadyBooting := m.booting[funcName]
 	if alreadyBooting {
@@ -98,7 +103,9 @@ func (m *Manager) boot(ctx context.Context, funcName string) (*model.Instance, e
 
 // Invalidate removes any cached entry pointing at the given instance.
 func (m *Manager) Invalidate(instanceID string) {
-	return
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.invalidateLocked(instanceID)
 }
 
 func (m *Manager) invalidateLocked(instanceID string) {

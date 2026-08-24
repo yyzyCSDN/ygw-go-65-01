@@ -63,8 +63,12 @@ func (s *Scaler) finishReclaim(instanceID string) error {
 	inst.State = model.InstanceRemoved
 	delete(s.instances, instanceID)
 	s.removeRoutesLocked(instanceID)
+	onReclaim := s.onReclaim
 	s.mu.Unlock()
 	close(inst.Stop)
+	if onReclaim != nil {
+		onReclaim(instanceID)
+	}
 	return nil
 }
 
