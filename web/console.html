@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>FnExec Console</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 2rem; background: #f6f8fa; color: #24292f; }
+    h1 { font-size: 1.4rem; }
+    .card { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #eaeef2; }
+    input, select { padding: .3rem .5rem; margin: .25rem 0; }
+    button { padding: .35rem .8rem; }
+    code { background: #eff1f3; padding: .1rem .35rem; border-radius: 4px; }
+    #result { white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <h1>FnExec 无服务器函数执行引擎</h1>
+  <p>版本 <code id="version">-</code> · 运行时长 <code id="uptime">-</code> 秒</p>
+
+  <div class="card">
+    <h2>调用</h2>
+    <select id="func"></select>
+    <input id="payload" size="60" value='{"text":"hello"}' placeholder='{"text":"hello"}'>
+    <button onclick="invoke()">触发</button>
+    <pre id="result">尚未触发</pre>
+  </div>
+
+  <div class="card">
+    <h2>统计</h2>
+    <table>
+      <tr><th>队列待处理</th><td id="qlen">-</td></tr>
+      <tr><th>执行次数</th><td id="exec">-</td></tr>
+      <tr><th>成功 / 失败 / 超时</th><td id="outcome">-</td></tr>
+      <tr><th>冷启动缓存</th><td id="cold">-</td></tr>
+      <tr><th>重试次数</th><td id="retries">-</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>实例与路由</h2>
+    <table id="instances"><tr><th>实例 ID</th><th>函数</th><th>状态</th><th>运行中</th></tr></table>
+    <h3>路由</h3>
+    <pre id="routes">-</pre>
+  </div>
+
+  <script>
+    async function refresh() {
+      const res = await fetch("/api/stats");
+      const s = await res.json();
+      document.getElementById("version").textContent = s.version;
+      document.getElementById("uptime").textContent = s.uptime_seconds;
+      document.getElementById("qlen").textContent = s.queue.pending;
+      document.getElementById("exec").textContent = s.exec.executions;
+      document.getElementById("outcome").textContent =
+        s.exec.successes + " / " + s.exec.failures + " / " + s.exec.timeouts;
+      document.getElementById("cold").textContent = s.cold_cache;
+      document.getElementById("retries").textContent = s.retries;
+      document.getElementById("routes").textContent = JSON.stringify(s.routes, null, 2);
+      const select = document.getElementById("func");
+      select.innerHTML = "";
+      for (const fn of s.functions) {
+        const opt = document.createElement("option");
+        opt.value = fn.name;
+        opt.textContent = fn.name;
+        select.appendChild(opt);
+      }
+      const rows = document.getElementById("instances");
+      rows.innerHTML = "<tr><th>实例 ID</th><th>函数</th><th>状态</th><th>运行中</th></tr>";
+      for (const inst of s.instances) {
+        const tr = document.createElement("tr");
+        for (const key of ["id", "func_name", "state", "running"]) {
+          const td = document.createElement("td");
+          td.textContent = inst[key];
+          tr.appendChild(td);
+        }
+        rows.appendChild(tr);
+      }
+    }
+    async function invoke() {
+      const payload = document.getElementById("payload").value;
+      let parsed = payload;
+      try { parsed = JSON.parse(payload); } catch (_) { /* keep raw */ }
+      const res = await fetch("/api/invoke", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ func: document.getElementById("func").value, payload: parsed })
+      });
+      const out = await res.json();
+      document.getElementById("result").textContent = JSON.stringify(out, null, 2);
+    }
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
