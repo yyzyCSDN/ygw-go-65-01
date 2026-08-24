@@ -73,7 +73,46 @@ func NewExecutor(cfg Config) *Executor {
 }
 
 // Dispatch executes one call exactly once, recording the outcome.
+//
+// During cold-start bursts the same event can be submitted more than once, and
+// because the call ID is derived from the event identity those submissions land
+// in the queue as distinct entries sharing one ID. Without coordination every
+// worker that pulls one would execute it, so the call runs twice and produces
+// duplicate side effects. Deduplication happens in two layers:
+//
+//   - Committed-success guard: a duplicate arriving after the call already
+//     finished successfully is dropped without re-running or overwriting the
+//     stored outcome. Retries are unaffected because the retry path only
+//     re-enqueues calls that have not yet succeeded.
+//   - In-flight claim: a duplicate arriving while the call is still running
+//     loses the claim race and is dropped, so two workers never execute the
+//     same call concurrently.
 func (e *Executor) Dispatch(ctx context.Context, call *model.Call) *model.Result {
+	if e.results.CommittedSuccess(call.ID) {
+		// The call already finished successfully; a replayed duplicate must not
+		// run again or overwrite the committed outcome.
+		return nil
+	}
+	if !e.claims.TryClaim(call.ID) {
+		// Another worker already owns this call ID; skip the duplicate so the
+		// call is executed exactly once.
+		return nil
+	}
+
+	result := e.dispatchClaimed(ctx, call)
+	// Drop the claim before the caller (or a scheduled retry) proceeds. The
+	// retried call reuses the same ID and must be claimable by whichever worker
+	// picks it up next, so the claim cannot outlive this dispatch.
+	e.claims.Release(call.ID)
+	if result != nil && !result.Succeeded() && e.retry.ShouldRetry(call, result) {
+		_ = e.retry.Schedule(call)
+	}
+	return result
+}
+
+// dispatchClaimed runs the call body once it has been claimed by Dispatch. The
+// caller owns releasing the claim and scheduling any retry.
+func (e *Executor) dispatchClaimed(ctx context.Context, call *model.Call) *model.Result {
 	call.Status = model.StatusExecuting
 	inst, err := e.pickInstance(ctx, call)
 	if err != nil {
@@ -91,9 +130,6 @@ func (e *Executor) Dispatch(ctx context.Context, call *model.Call) *model.Result
 		call.Status = model.StatusTimedOut
 	default:
 		call.Status = model.StatusFailed
-	}
-	if !result.Succeeded() && e.retry.ShouldRetry(call, result) {
-		_ = e.retry.Schedule(call)
 	}
 	return result
 }

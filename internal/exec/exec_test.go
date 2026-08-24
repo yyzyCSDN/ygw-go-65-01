@@ -3,6 +3,8 @@ package exec
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -136,5 +138,104 @@ func TestDispatchUnknownErrorSurfaces(t *testing.T) {
 	}
 	if result.Error != "handler exploded" {
 		t.Fatalf("unexpected error text %q", result.Error)
+	}
+}
+
+// TestDispatchDedupesConcurrentSameID reproduces the cold-start burst where
+// the same event arrives more than once, so two queue entries share one call
+// ID and two workers dispatch them at the same time. The call must execute
+// exactly once; the duplicate dispatch returns nil and runs no handler.
+func TestDispatchDedupesConcurrentSameID(t *testing.T) {
+	ex, reg, _, _, _, _ := testExecutor(t, 0)
+
+	gate := make(chan struct{})
+	var runs atomic.Int64
+	reg.Register(&model.Function{
+		Name:    "once",
+		Timeout: time.Second,
+		Handler: func(ctx context.Context, payload []byte) ([]byte, error) {
+			runs.Add(1)
+			// Hold the first execution open until both dispatchers have entered
+			// Dispatch, so the duplicate cannot simply lose the race on timing.
+			<-gate
+			return payload, nil
+		},
+	})
+
+	const callID = "dup-1"
+	deadline := time.Now().Add(2 * time.Second)
+
+	var wg sync.WaitGroup
+	var r1, r2 *model.Result
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		r1 = ex.Dispatch(context.Background(), model.NewCall(callID, "once", []byte("x"), deadline))
+	}()
+	go func() {
+		defer wg.Done()
+		// Give the first dispatcher a head start so it claims the call before
+		// the duplicate arrives, mirroring the burst where both land together.
+		time.Sleep(10 * time.Millisecond)
+		r2 = ex.Dispatch(context.Background(), model.NewCall(callID, "once", []byte("x"), deadline))
+	}()
+
+	// Wait for the handler to be running, then release it.
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+
+	if runs.Load() != 1 {
+		t.Fatalf("handler must run exactly once, ran %d times", runs.Load())
+	}
+	// Exactly one dispatch produced a result; the other returned nil.
+	if (r1 == nil) == (r2 == nil) {
+		t.Fatalf("exactly one dispatch must return a result, got %v and %v", r1, r2)
+	}
+	var got *model.Result
+	if r1 != nil {
+		got = r1
+	} else {
+		got = r2
+	}
+	if !got.Succeeded() {
+		t.Fatalf("dispatched call must succeed, got %+v", got)
+	}
+	// Only one result is stored for the call ID.
+	if count := ex.Results().Count(); count != 1 {
+		t.Fatalf("result store must hold one outcome, got %d", count)
+	}
+}
+
+// TestDispatchDedupesAlreadySucceeded guards against a delayed duplicate
+// arriving after the first execution already finished successfully: it must
+// not re-execute the call or overwrite the stored success.
+func TestDispatchDedupesAlreadySucceeded(t *testing.T) {
+	ex, reg, _, _, _, _ := testExecutor(t, 0)
+	var runs atomic.Int64
+	reg.Register(&model.Function{
+		Name:    "stable",
+		Timeout: time.Second,
+		Handler: func(ctx context.Context, payload []byte) ([]byte, error) {
+			runs.Add(1)
+			return payload, nil
+		},
+	})
+	const callID = "dup-2"
+	deadline := time.Now().Add(2 * time.Second)
+	first := ex.Dispatch(context.Background(), model.NewCall(callID, "stable", []byte("y"), deadline))
+	if !first.Succeeded() {
+		t.Fatalf("first dispatch must succeed, got %+v", first)
+	}
+	// A duplicate arrives later, after the first finished and released its claim.
+	second := ex.Dispatch(context.Background(), model.NewCall(callID, "stable", []byte("y"), deadline))
+	if second != nil {
+		t.Fatalf("duplicate after success must be skipped, got %+v", second)
+	}
+	if runs.Load() != 1 {
+		t.Fatalf("handler must run once total, ran %d times", runs.Load())
+	}
+	if !ex.Results().CommittedSuccess(callID) {
+		t.Fatal("stored success must remain intact")
 	}
 }

@@ -44,6 +44,11 @@ func NewManager(registry funcRegistry, booter Booter, liveness InstanceLiveness)
 }
 
 // Ensure returns a ready instance for the function, booting one if needed.
+//
+// Concurrent callers for the same function collapse onto a single boot: the
+// first caller to observe a cache miss performs the boot while later callers
+// wait on the same done channel and reuse the one booting instance. Without
+// this, a cold-start burst booted one instance per concurrent call.
 func (m *Manager) Ensure(ctx context.Context, funcName string) (*model.Instance, error) {
 	m.mu.Lock()
 	if inst, ok := m.cache[funcName]; ok {
@@ -54,13 +59,56 @@ func (m *Manager) Ensure(ctx context.Context, funcName string) (*model.Instance,
 			return inst, nil
 		}
 	}
+	// Re-check the cache after invalidation while still holding the lock; if
+	// another caller already replaced the entry there is nothing to boot.
+	if inst, ok := m.cache[funcName]; ok {
+		m.mu.Unlock()
+		return inst, nil
+	}
+	done, leader := m.singleflightLocked(funcName)
 	m.mu.Unlock()
+
+	if !leader {
+		// Followers wait for the leader's boot to finish. They must not pass a
+		// cancelled context off as a boot failure: only the leader owns that.
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		inst, ok := m.cache[funcName]
+		if !ok {
+			return nil, ErrNoCapacity
+		}
+		return inst, nil
+	}
+
+	// Leader performs the boot without holding the mutex so followers can
+	// register on the done channel concurrently.
 	inst, err := m.boot(ctx, funcName)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	close(done)
+	delete(m.booting, funcName)
 	if err != nil {
 		return nil, err
 	}
 	m.cache[funcName] = inst
 	return inst, nil
+}
+
+// singleflightLocked returns the done channel for an in-flight boot of the
+// function and reports whether the caller is the leader responsible for
+// performing it. The mutex must be held.
+func (m *Manager) singleflightLocked(funcName string) (done chan struct{}, leader bool) {
+	if ch, ok := m.booting[funcName]; ok {
+		return ch, false
+	}
+	done = make(chan struct{})
+	m.booting[funcName] = done
+	return done, true
 }
 
 func (m *Manager) boot(ctx context.Context, funcName string) (*model.Instance, error) {

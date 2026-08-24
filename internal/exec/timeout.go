@@ -13,7 +13,11 @@ type handlerOutcome struct {
 }
 
 // finalizeTimeout settles a call whose deadline expired. If the handler
-// already produced a result, that result wins and no retry is scheduled.
+// already produced a result, that result wins. finalizeTimeout only records
+// the outcome; retry scheduling is owned by Dispatch, which is the single
+// authority that re-enqueues a call. Scheduling here as well would double-enqueue
+// the same call and let a second worker re-execute it once the first releases
+// its claim.
 func (e *Executor) finalizeTimeout(call *model.Call, drain func() (handlerOutcome, bool)) *model.Result {
 	if o, ok := drain(); ok {
 		return e.finishResult(call, o)
@@ -30,7 +34,6 @@ func (e *Executor) finalizeTimeout(call *model.Call, drain func() (handlerOutcom
 	}
 	e.results.Commit(result)
 	e.stats.RecordTimeout()
-	e.retry.Schedule(call)
 	return result
 }
 
