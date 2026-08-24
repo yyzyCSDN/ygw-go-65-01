@@ -72,12 +72,20 @@ func NewExecutor(cfg Config) *Executor {
 	}
 }
 
-// Dispatch executes one call exactly once, recording the outcome.
+// Dispatch executes one call exactly once, recording the outcome. A call that
+// already committed a successful outcome is returned as-is without running
+// again: a retry triggered by a network blip must never re-execute a call that
+// already finished, otherwise its side effects would be replayed downstream.
 func (e *Executor) Dispatch(ctx context.Context, call *model.Call) *model.Result {
 	if !e.claims.TryClaim(call.ID) {
 		return e.results.Get(call.ID)
 	}
 	defer e.claims.Release(call.ID)
+
+	if committed := e.results.Get(call.ID); committed != nil && committed.Succeeded() {
+		call.Status = model.StatusSucceeded
+		return committed
+	}
 
 	call.Status = model.StatusExecuting
 	inst, err := e.pickInstance(ctx, call)

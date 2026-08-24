@@ -48,8 +48,15 @@ func (m *Manager) SetChecker(checker SuccessChecker) {
 	m.checker = checker
 }
 
-// Schedule re-enqueues a call for another attempt when allowed.
+// Schedule re-enqueues a call for another attempt when allowed. Before
+// re-enqueuing it first confirms the call has not already committed a
+// successful outcome: a network blip that triggers a retry must never cause a
+// call that already finished to be executed again, since that would replay its
+// side effects downstream.
 func (m *Manager) Schedule(call *model.Call) error {
+	if m.committedSuccess(call.ID) {
+		return nil
+	}
 	if call.Attempt > m.maxRetries {
 		return ErrMaxRetries
 	}
@@ -65,12 +72,27 @@ func (m *Manager) Schedule(call *model.Call) error {
 	return nil
 }
 
-// ShouldRetry reports whether a failed call may be attempted again.
+// committedSuccess reports whether a call already recorded a successful
+// outcome via the installed checker. When no checker is wired up the call is
+// treated as not-yet-committed so retries keep their existing behavior.
+func (m *Manager) committedSuccess(callID string) bool {
+	m.mu.Lock()
+	checker := m.checker
+	m.mu.Unlock()
+	return checker != nil && checker.CommittedSuccess(callID)
+}
+
+// ShouldRetry reports whether a failed call may be attempted again. A call that
+// already committed a successful outcome is never retried: re-running it would
+// replay its side effects downstream even though the work is already done.
 func (m *Manager) ShouldRetry(call *model.Call, result *model.Result) bool {
 	if result == nil || result.Succeeded() {
 		return false
 	}
 	if call == nil || call.Attempt > m.maxRetries {
+		return false
+	}
+	if m.committedSuccess(call.ID) {
 		return false
 	}
 	return true
